@@ -515,6 +515,13 @@ KiSystemStartup(IN PLOADER_PARAMETER_BLOCK LoaderBlock)
     /* Get Pcr from loader block */
     Pcr = CONTAINING_RECORD(LoaderBlock->Prcb, KIPCR, Prcb);
 
+    if (Cpu != 0)
+    {
+        /* Leave the shared bootstrap tables before the next AP reuses them. */
+        __writecr3(Pcr->Prcb.ProcessorState.SpecialRegisters.Cr3);
+        KeFlushCurrentTb();
+    }
+
     /* Set the PRCB for this Processor */
     KiProcessorBlock[Cpu] = &Pcr->Prcb;
 
