@@ -62,6 +62,10 @@ VOID
 #define IDT_DEVICE              0x21
 
 #ifdef _M_AMD64
+/* Page 0 holds the 16/32/64-bit AP entry code, the remaining pages hold the
+ * temporary identity-mapping tables (PML4 + PDPT + one PD) needed to bring an
+ * application processor into long mode. Keep this small: HalpMapPhysicalMemory64
+ * only has a few free PTEs in the HAL heap at this point. */
 #define HALP_LOW_STUB_SIZE_IN_PAGES 5
 #else
 #define HALP_LOW_STUB_SIZE_IN_PAGES 3

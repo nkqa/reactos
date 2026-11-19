@@ -21,13 +21,50 @@ extern BOOLEAN HalpOnlyBootProcessor;
 extern PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
 extern PVOID HalpLowStub;
 
-// The data necessary for a boot (stored inside HalpLowStub)
+/* Symbols inside the block copied to HalpLowStub (see apentry.S) */
 extern PVOID HalpAPEntry16;
-extern PVOID HalpAPEntryData;
 extern PVOID HalpAPEntry16End;
+extern PVOID HalpAPJump16;
+extern PVOID HalpAPJump32;
 extern PVOID HalpAPEntry32;
 extern PVOID HalpAPEntry64;
+extern PVOID HalpAPEntryData;
+extern PVOID HalpMinimalGdtDesc;
 extern HALP_APIC_INFO_TABLE HalpApicInfoTable;
+
+/* Diagnostics: visible on the boot screen, removed once AP startup is proven */
+VOID NTAPI HalDisplayString(PCSTR String);
+
+/* Minimal COM1 output used for early diagnostics (QEMU captures it) */
+static
+VOID
+HalpSerialChar(
+    _In_ CHAR Char)
+{
+    ULONG Spin = 200000;
+    while (!(READ_PORT_UCHAR((PUCHAR)0x3FD) & 0x20) && --Spin)
+        ;
+    WRITE_PORT_UCHAR((PUCHAR)0x3F8, (UCHAR)Char);
+}
+
+static
+VOID
+HalpSerialString(
+    _In_ PCSTR String)
+{
+    while (*String)
+        HalpSerialChar(*String++);
+}
+
+static
+VOID
+HalpSerialHex(
+    _In_ ULONG64 Value)
+{
+    static const CHAR Digits[] = "0123456789ABCDEF";
+    for (INT i = 60; i >= 0; i -= 4)
+        HalpSerialChar(Digits[(Value >> i) & 0xF]);
+}
 
 ULONG HalpStartedProcessorCount = 1;
 
@@ -38,18 +75,54 @@ ULONG HalpStartedProcessorCount = 1;
 #define PtrOffset(B,O) ((ULONG)((ULONG_PTR)(O) - (ULONG_PTR)(B)))
 #endif
 
-/* AMD64 AP entry data structure - matches offsets in apentry.S
- * Size must be <= HALP_LOW_STUB_SIZE_IN_BYTES (16KB).
+/*
+ * Boot variables read by the AP entry code. This layout must match the
+ * HalpAPEntryData block in apentry.S exactly.
+ *
+ * Everything the long mode stage needs is passed as a plain value, so the
+ * assembly never has to know the layout of KPROCESSOR_STATE.
  */
 typedef struct _AP_ENTRY_DATA_AMD64
 {
-    ULONG64 PageTableRoot32;   /* CR3 for 32-bit PAE stage (phys, < 4GB) */
-    ULONG PaeCr4;              /* CR4 with PAE bit set */
-    ULONG EferFlags;           /* EFER value with LME + SCE */
-    ULONG64 PageTableRoot64;   /* Full kernel 64-bit CR3 (high phys OK) */
-    ULONG64 ProcessorState;    /* VA of PKPROCESSOR_STATE (kernel linear) */
-    ULONG64 FlatBase;          /* Phys==Linear base of low stub region */
+    ULONG64 PageTableRoot32;   /* Temporary PAE CR3 used while enabling paging */
+    ULONG PaeCr4;              /* CR4 value with PAE set */
+    ULONG EferFlags;           /* EFER value with LME | SCE */
+    ULONG64 PageTableRoot64;   /* Long mode CR3 (temporary PML4) */
+    ULONG64 Cr0;               /* CR0 value to restore */
+    ULONG64 BootCr3;           /* Boot processor CR3, cloned into the PML4 */
+    ULONG64 Pcr;               /* Kernel VA of this processor's PCR */
+    ULONG64 KernelStack;       /* Initial RSP for the kernel entry */
+    ULONG64 EntryPoint;        /* Initial RIP for the kernel entry */
+    ULONG64 FlatBase;          /* Physical base of this block */
+    ULONG64 GdtrBase;          /* GDT to load */
+    ULONG GdtrLimit;
+    ULONG GdtrPad;
+    ULONG64 IdtrBase;          /* IDT to load */
+    ULONG IdtrLimit;
+    ULONG IdtrPad;
+    ULONG TssSelector;         /* Task register to load */
+    ULONG TssPad;
 } AP_ENTRY_DATA_AMD64, *PAP_ENTRY_DATA_AMD64;
+
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, PageTableRoot32) == 0x00);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, PaeCr4) == 0x08);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, EferFlags) == 0x0C);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, PageTableRoot64) == 0x10);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, Cr0) == 0x18);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, BootCr3) == 0x20);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, Pcr) == 0x28);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, KernelStack) == 0x30);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, EntryPoint) == 0x38);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, FlatBase) == 0x40);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, GdtrBase) == 0x48);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, GdtrLimit) == 0x50);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, IdtrBase) == 0x58);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, IdtrLimit) == 0x60);
+C_ASSERT(FIELD_OFFSET(AP_ENTRY_DATA_AMD64, TssSelector) == 0x68);
+C_ASSERT(sizeof(AP_ENTRY_DATA_AMD64) == 0x70);
+
+/* KIPCR.Prcb sits at a fixed offset on AMD64; see sdk/include/ndk/amd64/ketypes.h */
+#define HALP_PCR_PRCB_OFFSET 0x180
 
 /* FUNCTIONS *****************************************************************/
 
@@ -58,127 +131,169 @@ ULONG64
 HalpGetPhysAddr(
     _In_ PVOID Va)
 {
-    /* HAL can call kernel export directly.
-     * Returns physical address as ULONG64.
-     */
     PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(Va);
     return pa.QuadPart;
 }
 
+/*
+ * Build the temporary translation tables used while the AP is being brought
+ * up. Page 0 of the low stub holds the entry code, pages 1..6 are used here:
+ *
+ *   page 1 : PML4 (temporary, entry 0 points at the PDPT)
+ *   page 2 : PDPT (low 4 GiB)
+ *   page 3 : PD0  (identity 0 - 1 GiB, 2 MiB pages)
+ *   page 4 : PD1  (identity 1 - 2 GiB)
+ *   page 5 : PD2  (identity 2 - 3 GiB)
+ *   page 6 : PD3  (identity 3 - 4 GiB)
+ *
+ * The low 4 GiB are identity mapped with 2 MiB pages so both the 32-bit PAE
+ * stage and the long mode stage can keep executing the trampoline, and so the
+ * long mode stage can read the boot processor PML4 (which always lives below
+ * 4 GiB at this point) in order to clone the kernel address space.
+ */
 static
-ULONG64
-HalpSetupTempCr3Amd64(
-    VOID)
+BOOLEAN
+HalpBuildApPageTables(
+    _Out_ PULONG64 PageTableRoot32,
+    _Out_ PULONG64 PageTableRoot64)
 {
-    /*
-     * Build a simple PAE page table for the 32-bit AP stage.
-     *
-     * 32-bit PAE layout: CR3 -> PDPT -> PD -> PT
-     *
-     * We need to:
-     *   1. Identity-map the low stub region (so AP can read boot data)
-     *   2. Identity-map the full 4GB physical space (using 2MB huge pages)
-     *
-     * With 2MB huge pages in PD, we skip PT entirely:
-     *   - PDPT has 4 entries (covers 0-4GB virtual)
-     *   - Each PDPT entry -> 1 PD (512 PDEs, each 2MB huge page = 1GB per PD)
-     *   - Total: 1 PDPT page + 4 PD pages = 5 pages total
-     *
-     * Allocated at HalpLowStub + 4096 (keep first page for entry code).
-     */
-
-    /* Allocate space for PDPT + 4 PDs after the entry code page */
-    PVOID Pdp  = Add2Ptr(HalpLowStub, PAGE_SIZE * 1);   /* +4KB */
-    PVOID Pd0  = Add2Ptr(HalpLowStub, PAGE_SIZE * 2);   /* +8KB */
-    PVOID Pd1  = Add2Ptr(HalpLowStub, PAGE_SIZE * 3);   /* +12KB */
-    PVOID Pd2  = Add2Ptr(HalpLowStub, PAGE_SIZE * 4);   /* +16KB */
-    PVOID Pd3  = Add2Ptr(HalpLowStub, PAGE_SIZE * 5);   /* +20KB */
-
-    /* Zero everything */
-    RtlZeroMemory(Pdp, PAGE_SIZE);
-    RtlZeroMemory(Pd0, PAGE_SIZE);
-    RtlZeroMemory(Pd1, PAGE_SIZE);
-    RtlZeroMemory(Pd2, PAGE_SIZE);
-    RtlZeroMemory(Pd3, PAGE_SIZE);
-
-    /* Get physical addresses of our page tables (must be < 4GB for PAE CR3) */
-    ULONG64 Pd0Pa = HalpGetPhysAddr(Pd0);
-    ULONG64 Pd1Pa = HalpGetPhysAddr(Pd1);
-    ULONG64 Pd2Pa = HalpGetPhysAddr(Pd2);
-    ULONG64 Pd3Pa = HalpGetPhysAddr(Pd3);
-
-    /* PDPT entries:
-     * Format: [phys_page_frame_number][51:12] | [flags:11:0]
-     * Flags: P=1, RW=1 (0x03), PS=0 (not huge at PDPT level)
-     */
-    ((PULONG64)Pdp)[0] = (Pd0Pa << 12) | 0x03ULL;
-    ((PULONG64)Pdp)[1] = (Pd1Pa << 12) | 0x03ULL;
-    ((PULONG64)Pdp)[2] = (Pd2Pa << 12) | 0x03ULL;
-    ((PULONG64)Pdp)[3] = (Pd3Pa << 12) | 0x03ULL;
-
-    /* PD entries with 2MB huge pages:
-     * Format: [phys_2mb_page_frame][51:12] | [flags:11:0]
-     * Flags: P=1, RW=1, PS=1 (2MB huge page), G=1 = 0x183
-     */
-    for (ULONG pd_idx = 0; pd_idx < 4; ++pd_idx)
+    /* The low stub VA is provided by the ACPI HAL code */
+    PVOID StubBase = HalpLowStub;
+    if (!StubBase || ((ULONG64)(ULONG_PTR)StubBase < 0xFFFF800000000000ULL))
     {
-        PVOID Pd = Add2Ptr(HalpLowStub, PAGE_SIZE * (2 + pd_idx));
-        PULONG64 Entries = (PULONG64)Pd;
-        ULONG64 BasePhy = (ULONG64)pd_idx * 0x40000000ULL; /* Each PD covers 1GB */
+        HalpSerialString("AP: bad stub VA\r\n");
+        return FALSE;
+    }
 
-        for (ULONG i = 0; i < 512; ++i)
+    PVOID Pml4 = Add2Ptr(StubBase, PAGE_SIZE * 1);
+    PVOID Pdp  = Add2Ptr(StubBase, PAGE_SIZE * 2);
+
+    HalpSerialString("AP: Stub=");
+    HalpSerialHex((ULONG64)(ULONG_PTR)StubBase);
+    HalpSerialString(" Phys=");
+    HalpSerialHex(HalpLowStubPhysicalAddress.QuadPart);
+    HalpSerialString("\r\n");
+
+    RtlZeroMemory(Pml4, PAGE_SIZE);
+    RtlZeroMemory(Pdp, PAGE_SIZE);
+
+    ULONG64 Pml4Pa = HalpGetPhysAddr(Pml4);
+    ULONG64 PdpPa  = HalpGetPhysAddr(Pdp);
+
+    HalpSerialString("AP: Pml4Pa=");
+    HalpSerialHex(Pml4Pa);
+    HalpSerialString(" PdpPa=");
+    HalpSerialHex(PdpPa);
+    HalpSerialString("\r\n");
+
+    /* The 32-bit stage can only load the low 32 bits of CR3 */
+    if ((Pml4Pa | PdpPa) >> 32)
+    {
+        DPRINT1("HalpBuildApPageTables: low stub above 4 GiB\n");
+        return FALSE;
+    }
+
+    /* A single page directory covers the low 1 GiB identity mapping, which is
+     * enough for the trampoline, the page tables and the boot PML4 itself. */
+    for (ULONG Index = 0; Index < 1; Index++)
+    {
+        PVOID Pd = Add2Ptr(StubBase, PAGE_SIZE * (3 + Index));
+        RtlZeroMemory(Pd, PAGE_SIZE);
+
+        ULONG64 PdPa = HalpGetPhysAddr(Pd);
+        if (PdPa >> 32)
         {
-            ULONG64 PhysPage = BasePhy + (ULONG64)i * 0x200000ULL;
-            Entries[i] = (PhysPage << 12) | 0x183ULL; /* P + RW + PS + G */
+            DPRINT1("HalpBuildApPageTables: page directory above 4 GiB\n");
+            return FALSE;
+        }
+
+        /* PDPT entry -> page directory */
+        ((PULONG64)Pdp)[Index] = (PdPa & ~0xFFFULL) | 0x03ULL;
+
+        /* 2 MiB identity pages: P + RW + PS + G */
+        ULONG64 Base = (ULONG64)Index * 0x40000000ULL;
+        for (ULONG i = 0; i < 512; i++)
+        {
+            ((PULONG64)Pd)[i] = (Base + ((ULONG64)i * 0x200000ULL)) | 0x183ULL;
         }
     }
 
-    /* CR3 = Physical address of PDPT (low 12 bits must be 0) */
-    ULONG64 PdpPa = HalpGetPhysAddr(Pdp);
-    ASSERT((PdpPa & 0xFFF) == 0);       /* Page aligned */
-    ASSERT(PdpPa < 0x100000000ULL);     /* < 4GB for 32-bit stage */
-    return PdpPa;
+    /* PML4 entry 0 wraps the PDPT, giving the low 4 GiB identity mapping.
+     * Entries 1..511 are cloned from the boot processor by the AP itself,
+     * which avoids mapping page tables this early during Phase 0. */
+    ((PULONG64)Pml4)[0] = (PdpPa & ~0xFFFULL) | 0x03ULL;
+
+    /* The AP reads the boot PML4 through the identity mapping, so it must be
+     * reachable from the 32-bit address space. */
+    ULONG64 BootCr3 = __readcr3() & ~0xFFFULL;
+    if (BootCr3 >> 32)
+    {
+        DPRINT1("HalpBuildApPageTables: boot PML4 above 4 GiB (0x%I64x)\n", BootCr3);
+        return FALSE;
+    }
+
+    *PageTableRoot32 = PdpPa;
+    *PageTableRoot64 = Pml4Pa;
+    return TRUE;
 }
 
+/*
+ * Fill in the runtime values of the copied block. All offsets are derived from
+ * exported labels instead of being hardcoded, so the assembly layout can
+ * change without silently corrupting the trampoline.
+ */
 static
 VOID
 HalpPatchApEntryAmd64(
-    VOID)
+    _In_ ULONG64 PageTableRoot32,
+    _In_ ULONG64 PageTableRoot64,
+    _In_ ULONG PaeCr4,
+    _In_ ULONG EferFlags,
+    _In_ PKPROCESSOR_STATE ProcessorState,
+    _In_ ULONG64 Pcr)
 {
-    /*
-     * Patch runtime-computed values into the low stub copy of apentry code.
-     *
-     * Offsets from HalpAPEntry16 in our low stub copy:
-     *   +0x58: 16-bit far-jump offset (32-bit, patched to HalpAPEntry32 phys)
-     *   +0x5C: 16-bit far-jump selector (32-bit, patched to 0x00000008)
-     *   +0x62: MinimalGdtDesc.base low 32 bits (patched to low stub phys)
-     *   +0xAC: 32-bit far-jump offset (32-bit, patched to HalpAPEntry64 phys)
-     *
-     * The low stub uses identity mapping (phys == linear < 4GB), and
-     * flat GDT segments (base == 0). So in protected mode, EIP == phys addr.
-     *
-     * We use compile-time relative offsets (PtrOffset) to locate each
-     * patched field within the low stub copy.
-     */
     ULONG64 LowStubPhys = HalpLowStubPhysicalAddress.QuadPart;
-    PCHAR LowStub = (PCHAR)HalpLowStub;
+    PCHAR Base = (PCHAR)HalpLowStub;
 
-    /* 32-bit far jump offset: HalpAPEntry32 label + skip 0EAh opcode */
-    ULONG Off32JumpOffset = PtrOffset(HalpAPEntry16, HalpAPEntry32) + 3;
+    ULONG OffJump16 = PtrOffset(&HalpAPEntry16, &HalpAPJump16);
+    ULONG OffJump32 = PtrOffset(&HalpAPEntry16, &HalpAPJump32);
+    ULONG OffGdtDesc = PtrOffset(&HalpAPEntry16, &HalpMinimalGdtDesc);
+    ULONG OffData = PtrOffset(&HalpAPEntry16, &HalpAPEntryData);
 
-    /* Patch 16-bit far-jump offset: target HalpAPEntry32 phys address */
-    ULONG64 Phys32 = LowStubPhys + PtrOffset(HalpAPEntry16, HalpAPEntry32);
-    *(PULONG)(LowStub + 0x58) = (ULONG)(Phys32 & 0xFFFFFFFF);
+    /* Absolute physical targets of the 32-bit and 64-bit stages */
+    ULONG64 Phys32 = LowStubPhys + PtrOffset(&HalpAPEntry16, &HalpAPEntry32);
+    ULONG64 Phys64 = LowStubPhys + PtrOffset(&HalpAPEntry16, &HalpAPEntry64);
 
-    /* Patch 16-bit far-jump selector: 0x08 (32-bit flat code) */
-    *(PULONG)(LowStub + 0x5C) = 0x00000008;
+    ASSERT((Phys32 | Phys64) >> 32 == 0);
 
-    /* Patch MinimalGdtDesc.base low 32 bits: flat base of our low stub */
-    *(PULONG)(LowStub + 0x62) = (ULONG)(LowStubPhys & 0xFFFFFFFF);
+    /* 16-bit far jump: offset32 + selector16 0x08 */
+    *(PULONG)(Base + OffJump16) = (ULONG)Phys32;
+    *(PUSHORT)(Base + OffJump16 + 4) = 0x0008;
 
-    /* Patch 32-bit far-jump offset: target HalpAPEntry64 phys address */
-    ULONG64 Phys64 = LowStubPhys + PtrOffset(HalpAPEntry16, HalpAPEntry64);
-    *(PULONG)(LowStub + Off32JumpOffset) = (ULONG)(Phys64 & 0xFFFFFFFF);
+    /* 32-bit far jump: offset32 + selector16 0x18 */
+    *(PULONG)(Base + OffJump32) = (ULONG)Phys64;
+    *(PUSHORT)(Base + OffJump32 + 4) = 0x0018;
+
+    /* Minimal GDT base (16-bit lgdt takes a 32-bit base) */
+    *(PULONG)(Base + OffGdtDesc + 2) = (ULONG)LowStubPhys;
+
+    /* Boot variables */
+    PAP_ENTRY_DATA_AMD64 Data = (PAP_ENTRY_DATA_AMD64)(Base + OffData);
+    Data->PageTableRoot32 = PageTableRoot32;
+    Data->PaeCr4 = PaeCr4;
+    Data->EferFlags = EferFlags;
+    Data->PageTableRoot64 = PageTableRoot64;
+    Data->Cr0 = ProcessorState->SpecialRegisters.Cr0;
+    Data->BootCr3 = ProcessorState->SpecialRegisters.Cr3;
+    Data->Pcr = Pcr;
+    Data->KernelStack = ProcessorState->ContextFrame.Rsp;
+    Data->EntryPoint = ProcessorState->ContextFrame.Rip;
+    Data->FlatBase = LowStubPhys;
+    Data->GdtrBase = (ULONG64)(ULONG_PTR)ProcessorState->SpecialRegisters.Gdtr.Base;
+    Data->GdtrLimit = ProcessorState->SpecialRegisters.Gdtr.Limit;
+    Data->IdtrBase = (ULONG64)(ULONG_PTR)ProcessorState->SpecialRegisters.Idtr.Base;
+    Data->IdtrLimit = ProcessorState->SpecialRegisters.Idtr.Limit;
+    Data->TssSelector = ProcessorState->SpecialRegisters.Tr;
 }
 
 BOOLEAN
@@ -187,54 +302,77 @@ HalStartNextProcessor(
     _In_ PLOADER_PARAMETER_BLOCK LoaderBlock,
     _In_ PKPROCESSOR_STATE ProcessorState)
 {
-    ULONG64 TempCr3;
-    PAP_ENTRY_DATA_AMD64 ApEntryData;
+    ULONG64 PageTableRoot32, PageTableRoot64;
+    ULONG64 Pcr;
 
-    /* Bail out if we only use the boot CPU */
+    /* Only the boot processor requested */
     if (HalpOnlyBootProcessor)
         return FALSE;
 
-    /* Bail out if we have started all available CPUs */
+    /* All detected processors already started */
     if (HalpStartedProcessorCount >= HalpApicInfoTable.ProcessorCount)
         return FALSE;
 
-    /* Build temporary PAE page table for 32-bit stage */
-    TempCr3 = HalpSetupTempCr3Amd64();
-    if (!TempCr3)
+    HalDisplayString("AP: entered\n");
+
+    if (!HalpLowStubPhysicalAddress.QuadPart)
+    {
+        HalDisplayString("AP: no low stub\n");
         return FALSE;
+    }
 
-    /* Copy AP entry code into low stub (below 1MB, APIC SIPI requires this) */
-    ULONG EntrySize = (ULONG)((ULONG_PTR)HalpAPEntry16End - (ULONG_PTR)HalpAPEntry16);
+    /* Build the temporary identity mapping */
+    if (!HalpBuildApPageTables(&PageTableRoot32, &PageTableRoot64))
+    {
+        HalDisplayString("AP: page tables failed\n");
+        return FALSE;
+    }
+    HalDisplayString("AP: page tables\n");
+
+    /* Copy the trampoline below 1 MiB, where the SIPI vector can reach it */
+    ULONG EntrySize = (ULONG)((ULONG_PTR)&HalpAPEntry16End - (ULONG_PTR)&HalpAPEntry16);
     ASSERT(EntrySize <= PAGE_SIZE);
+    if (EntrySize > PAGE_SIZE)
+    {
+        HalDisplayString("AP: entry too large\n");
+        return FALSE;
+    }
     RtlCopyMemory(HalpLowStub, &HalpAPEntry16, EntrySize);
+    HalDisplayString("AP: entry copied\n");
 
-    /* Patch runtime values into the low stub copy */
-    HalpPatchApEntryAmd64();
+    /* LoaderBlock->Prcb points at KIPCR.Prcb of the new processor */
+    Pcr = (ULONG64)(ULONG_PTR)LoaderBlock->Prcb - HALP_PCR_PRCB_OFFSET;
 
-    /* Calculate AP_ENTRY_DATA location inside low stub
-     * The AP_ENTRY_DATA is embedded in apentry.S right after HalpAPEntryData label.
-     * We find it by computing the same offset.
-     */
-    ApEntryData = (PAP_ENTRY_DATA_AMD64)Add2Ptr(HalpLowStub,
-                   PtrOffset(HalpAPEntry16, HalpAPEntryData));
-
-    /* Fill the AP entry data (matches offsets in apentry.S) */
-    ApEntryData->PageTableRoot32 = TempCr3;
-    ApEntryData->PaeCr4          = (ULONG)(ProcessorState->SpecialRegisters.Cr4 | 0x00000020ULL); /* CR4.PAE */
-    ApEntryData->EferFlags       = 0xC0000080ULL; /* EFER.LME (0x400) + EFER.SCE (0x800) */
-    ApEntryData->PageTableRoot64 = ProcessorState->SpecialRegisters.Cr3;
-    ApEntryData->ProcessorState  = (ULONG64)(ULONG_PTR)ProcessorState;
-
-    /* Flat base = low stub physical (which equals linear due to identity mapping) */
-    ApEntryData->FlatBase = HalpLowStubPhysicalAddress.QuadPart;
-
-    DPRINT("HalStartNextProcessor: CPU %lu, LowStubPhys=%lx, TempCr3=%lx\n",
+    DPRINT("HalStartNextProcessor: CPU %lu, LowStub=%lx, PML4=%lx, PCR=%lx\n",
            HalpStartedProcessorCount,
            HalpLowStubPhysicalAddress.QuadPart,
-           TempCr3);
+           PageTableRoot64,
+           Pcr);
 
-    /* Send INIT + 2x SIPI to start the AP at our low stub address */
+    /* Patch the copied block with this processor's specific values.
+     * EFER.LME (0x400) puts the CPU into long mode, EFER.SCE (0x800) enables
+     * the syscall/sysret instructions. */
+    HalpPatchApEntryAmd64(PageTableRoot32,
+                          PageTableRoot64,
+                          (ULONG)(ProcessorState->SpecialRegisters.Cr4 | CR4_PAE),
+                          (ULONG)(0x400 | 0x800),
+                          ProcessorState,
+                          Pcr);
+    HalDisplayString("AP: patched, sending SIPI\n");
+
+    HalpSerialString("AP: count=");
+    HalpSerialHex(HalpApicInfoTable.ProcessorCount);
+    HalpSerialString(" idx=");
+    HalpSerialHex(HalpStartedProcessorCount);
+    HalpSerialString(" lapic=");
+    HalpSerialHex(HalpProcessorIdentity[HalpStartedProcessorCount].LapicId);
+    HalpSerialString(" start=");
+    HalpSerialHex(HalpLowStubPhysicalAddress.QuadPart);
+    HalpSerialString("\r\n");
+
+    /* Send INIT + two SIPIs */
     ApicStartApplicationProcessor(HalpStartedProcessorCount, HalpLowStubPhysicalAddress);
+    HalDisplayString("AP: SIPI sent\n");
 
     HalpStartedProcessorCount++;
     return TRUE;

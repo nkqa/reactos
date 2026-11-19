@@ -5,50 +5,67 @@
  * COPYRIGHT:   Copyright 2024 ReactOS Project
  *              Based on i386 AP entry by Victor Perevertkin and Justin Miller
  *
- * NOTE: Compiled with ml64.exe (MASM64).
- * 16-bit real-mode and 32-bit protected-mode stages are hand-encoded as raw
- * machine bytes (db/dw/dd/dq). The CPU decodes them correctly in each mode.
+ * This whole block is copied verbatim into HalpLowStub (below 1 MiB) by
+ * HalStartNextProcessor() and executed by the AP starting in real mode.
+ * Because everything lives inside a single copied block, all cross references
+ * inside it use rip-relative addressing or runtime-patched immediates.
  *
- * All absolute jump offsets are patched at runtime by HalStartNextProcessor
- * (see spinup.c) to avoid 32-bit ADDR32 relocations in a 64-bit DLL.
+ * Ml64 notes: the assembler only understands 64-bit code, so the 16-bit and
+ * 32-bit stages are hand-encoded machine code emitted with db/dw/dd/dq.
+ * asm.inc must NOT be included: its .code16/.code32 macros expand to
+ * ASSUME/use16/.586P which ml64 rejects.
+ *
+ * Layout of the copied block (relative to HalpAPEntry16):
+ *   HalpAPEntry16        16-bit real mode stage
+ *   HalpAPJump16         16-bit far jump immediate (offset32 + selector16)
+ *   HalpAPEntryData      boot variables patched by the HAL
+ *   HalpMinimalGdtDesc   6-byte lgdt operand for the minimal flat GDT
+ *   HalpMinimalGdt       six 8-byte GDT entries
+ *   HalpAPEntry32        32-bit protected mode stage
+ *   HalpAPJump32         32-bit far jump immediate (offset32 + selector16)
+ *   HalpAPEntry64        64-bit long mode stage
+ *   HalpFullGdtDesc      scratch lgdt operand built at runtime
+ *   HalpFullIdtDesc      scratch lidt operand built at runtime
+ *   HalpAPEntry16End     end of the copied block
  */
 
 PUBLIC HalpAPEntry16
+PUBLIC HalpAPJump16
 PUBLIC HalpAPEntryData
-PUBLIC HalpAPEntry16End
+PUBLIC HalpMinimalGdtDesc
+PUBLIC HalpMinimalGdt
 PUBLIC HalpAPEntry32
+PUBLIC HalpAPJump32
 PUBLIC HalpAPEntry64
+PUBLIC HalpAPEntry16End
 
-OPTION DOTNAME          /* Allow .name local labels */
+OPTION DOTNAME
 
 .code
 
-/*
- * ============================================================
- * 16-bit real-mode stage (raw machine bytes)
+/* ========================================================================
+ * 16-bit real mode stage
  *
- * At APIC SIPI entry: CS = vector << 12, IP = 0
- * Physical base = CS << 4 (identity-mapped < 4GB)
+ * On APIC SIPI entry: CS = vector << 12, IP = 0, so the physical base of this
+ * code is CS << 4. Everything below 1 MiB is identity mapped, and the minimal
+ * GDT installed here has a zero base, so "ebp + offset" addresses the copied
+ * block both before and after protected mode is enabled.
  *
- * Does: cli, flat segs, ebp=phys_base, CR3/CR4/EFER from HAL data,
- *       minimal GDT, enable PM, far-jump to 32-bit code.
- *
- * Offsets from HalpAPEntry16:
- *   +0x30 (abs 0x30): HalpAPEntryData (HAL-patched boot variables)
- *   +0x54: 66 EA (16-bit far jump opcode with 32-bit offset prefix)
- *   +0x58: JumpOffset  (patched by HAL to offset of HalpAPEntry32, CS-relative)
- *   +0x5C: JumpSelector (patched by HAL to 0x08)
- *   +0x60: MinimalGdtDesc (6-byte lgdt descriptor, base patched by HAL)
- *   +0x68: MinimalGdtEntries (6 flat GDT entries)
- *   +0x98: HalpAPEntry32 (32-bit PM stage starts here)
- * ============================================================
- */
+ * Steps: mask interrupts, flatten segments, derive ebp, load the temporary
+ * PAE CR3, enable PAE, turn on long mode in EFER, load the minimal GDT,
+ * enable protected mode and far jump into the 32-bit stage.
+ * ===================================================================== */
 HalpAPEntry16:
+
+    /* Progress marker: '0' on COM1 (very first instruction executed) */
+    db 0BAh, 0F8h, 003h                             /* mov dx, 03F8h */
+    db 0B0h, 030h                                   /* mov al, '0' */
+    db 0EEh                                         /* out dx, al */
 
     /* cli */
     db 0FAh
 
-    /* xor eax, eax + mov ds/es/ss/fs/gs, ax */
+    /* xor eax, eax ; mov ds/es/ss/fs/gs, ax */
     db 066h, 033h, 0C0h
     db 08Eh, 0D8h
     db 08Eh, 0C0h
@@ -56,93 +73,95 @@ HalpAPEntry16:
     db 08Eh, 0E0h
     db 08Eh, 0E8h
 
-    /* ebp = CS << 4 (flat physical base) */
-    db 066h, 00Fh, 0B7h, 0ECh       /* movzx ebp, cs */
-    db 066h, 0C1h, 0E5h, 004h       /* shl ebp, 4 */
+    /* ebp = CS << 4 : movzx ebp, cs ; shl ebp, 4 */
+    db 066h, 00Fh, 0B7h, 0ECh
+    db 066h, 0C1h, 0E5h, 004h
 
-    /* Load CR3 = PAE PDPT phys from [ebp + 0x30] */
-    db 066h, 067h, 08Bh, 085h, 030h, 000h, 000h, 000h
-    db 00Fh, 022h, 0D8h
+    /* mov bx, offset of the minimal GDT descriptor ; lgdt [ebp + ebx]
+     * lgdt is legal in real mode, but CR3/CR4/EFER are not: they are
+     * programmed by the 32-bit stage once protected mode is active. */
+    db 0BBh
+    dw (HalpMinimalGdtDesc - HalpAPEntry16)
+    db 067h, 00Fh, 001h, 094h, 01Dh, 000h, 000h, 000h, 000h
 
-    /* Load CR4 with PAE from [ebp + 0x38] */
-    db 066h, 067h, 08Bh, 085h, 038h, 000h, 000h, 000h
-    db 00Fh, 022h, 0E0h
+    /* Progress marker: emit '1' on COM1 (still real mode) */
+    db 0BAh, 0F8h, 003h                             /* mov dx, 03F8h */
+    db 0B0h, 031h                                   /* mov al, '1' */
+    db 0EEh                                         /* out dx, al */
 
-    /* Set EFER.LME + SCE in MSR 0xC0000080 */
-    db 0B9h, 080h, 000h, 000h, 0C0h
-    db 00Fh, 032h
-    db 066h, 067h, 00Bh, 085h, 03Ch, 000h, 000h, 000h
-    db 00Fh, 030h
-
-    /* lgdt [ebp + 0x60] - our minimal GDT descriptor */
-    db 066h, 067h, 00Fh, 001h, 095h, 060h, 000h, 000h, 000h
-
-    /* Enable PM: CR0.PE = 1 */
+    /* Enable protected mode: mov eax, cr0 ; or eax, 1 ; mov cr0, eax */
     db 00Fh, 020h, 0C0h
     db 083h, 0C8h, 001h
     db 00Fh, 022h, 0C0h
 
-    /* Far-jump to 32-bit PM code (selector 0x08).
-     * 16-bit mode with 32-bit offset prefix: 66 EA <off32> <sel16>
-     * Offsets are patched by HAL at runtime (see spinup.c). */
-    db 066h, 0EAh
+    /* marker 'y': protected mode enabled */
+    db 0B0h, 079h
+    db 0EEh
+
+    /* Far jump to the 32-bit stage: EA <offset32> <selector16 0x08>.
+     * No 0x66 prefix: the cleared CS left by SIPI already has D=1 on this
+     * CPU, so the default operand size is 32 bits and the offset below is
+     * consumed as a full dword. The immediate is patched at runtime. */
+    db 0EAh
+HalpAPJump16:
+    dd 000000000h
+    dw 00008h
+
+/* ------------------------------------------------------------------------
+ * Boot variables filled in by HalStartNextProcessor().
+ * Keep this layout in sync with AP_ENTRY_DATA_AMD64 in spinup.c.
+ * The long mode stage only reads these fields, so it never depends on the
+ * exact layout of KPROCESSOR_STATE.
+ * --------------------------------------------------------------------- */
 HalpAPEntryData:
-    /* HAL-patched boot data. Layout MUST match spinup.c AP_ENTRY_DATA_AMD64. */
-    /* +0x00 (abs 0x30): PageTableRoot32 (PDPT phys, < 4GB) */
-    dq 00000000000000000h
-    /* +0x08 (abs 0x38): PaeCr4 */
+    dq 00000000000000000h       /* +00 PageTableRoot32 : temporary PAE CR3     */
+    dd 000000000h               /* +08 PaeCr4          : CR4 with PAE set      */
+    dd 000000000h               /* +0C EferFlags       : EFER.LME | EFER.SCE   */
+    dq 00000000000000000h       /* +10 PageTableRoot64 : long mode CR3         */
+    dq 00000000000000000h       /* +18 Cr0                                     */
+    dq 00000000000000000h       /* +20 BootCr3         : boot PML4 to clone    */
+    dq 00000000000000000h       /* +28 Pcr             : PCR kernel VA         */
+    dq 00000000000000000h       /* +30 KernelStack     : initial RSP           */
+    dq 00000000000000000h       /* +38 EntryPoint      : initial RIP           */
+    dq 00000000000000000h       /* +40 FlatBase        : physical base         */
+    dq 00000000000000000h       /* +48 GdtrBase                                */
+    dd 000000000h               /* +50 GdtrLimit                               */
+    dd 000000000h               /* +54 (padding)                               */
+    dq 00000000000000000h       /* +58 IdtrBase                                */
+    dd 000000000h               /* +60 IdtrLimit                               */
+    dd 000000000h               /* +64 (padding)                               */
+    dd 000000000h               /* +68 TssSelector                             */
+    dd 000000000h               /* +6C (padding)                               */
+
+/* Minimal GDT: six flat entries, limit 6*8-1. The base is patched to the
+ * physical address of the copied block since 16-bit lgdt takes a 32-bit base. */
+HalpMinimalGdtDesc:
+    dw 0002Fh
     dd 000000000h
-    /* +0x0C (abs 0x3C): EferFlags (LME + SCE) */
-    dd 000000000h
-    /* +0x10 (abs 0x40): PageTableRoot64 (kernel 64-bit CR3 low 32 bits) */
-    dq 00000000000000000h
-    /* +0x18 (abs 0x48): ProcessorState (PKPROCESSOR_STATE virt addr) */
-    dq 00000000000000000h
-    /* +0x20 (abs 0x50): FlatBase (low stub physical) */
-    dq 00000000000000000h
 
-    /* +0x28 (abs 0x58): HalpAPEntry16JumpOffset (patched by HAL: abs addr of HalpAPEntry32 - HalpAPEntry16) */
-    dd 000000000h
-    /* +0x2C (abs 0x5C): HalpAPEntry16JumpSelector (0x08, patched by HAL) */
-    dd 000000000h
+HalpMinimalGdt:
+    dq 00000000000000000h       /* 0x00 null                                  */
+    dq 00C09A000000FFFFh        /* 0x08 32-bit code, base 0, limit 4 GiB      */
+    dq 00C092000000FFFFh        /* 0x10 32-bit data, base 0, limit 4 GiB      */
+    dq 00209A0000000001h        /* 0x18 64-bit code, long mode                */
+    dq 0000920000000001h        /* 0x20 64-bit data                           */
+    dq 00000000000000000h       /* 0x28 unused                                */
 
-    /* +0x30 (abs 0x60): MinimalGdtDesc. 6 bytes: 2-byte limit + 4-byte base.
-     * HAL patches base to low stub physical address. */
-MinimalGdtDesc:
-    dw 0002Fh                       /* limit = 6*8-1 = 47 */
-    dd 000000000h                   /* base (HAL patches to low stub phys) */
-
-    /* +0x38 (abs 0x68): MinimalGdtEntries (6 GDT entries, 8 bytes each) */
-MinimalGdtEntries:
-    dq 00000000000000000h           /* [0] Null */
-    dq 00C09A000000FFFFh           /* [1] 32-bit code, base=0, limit=4GB */
-    dq 00C092000000FFFFh           /* [2] 32-bit data, base=0, limit=4GB */
-    dq 00209A0000000001h           /* [3] 64-bit code, base=0, limit=1, L=1 */
-    dq 0000920000000001h           /* [4] 64-bit data, base=0, limit=1 */
-    dq 00000000000000000h           /* [5] reserved */
-
-HalpAPEntry16End:
-
-/*
- * ============================================================
- * 32-bit protected-mode stage (raw machine bytes)
+/* ========================================================================
+ * 32-bit protected mode stage
  *
- * At entry: CS=0x08, ebp=flat_phys_base, PE=1, PAE=1, CR3=PAE PDPT, EFER.LME=1
- *
- * Does: flat data segs, load kernel CR3, enable paging,
- *       far-jump to 64-bit long-mode code (selector 0x18).
- *
- * Offsets from HalpAPEntry16:
- *   +0x98: 32-bit PM code starts
- *   +0xAB: db 0EAh (far jump opcode)
- *   +0xAC: JumpOffset  (patched by HAL to abs addr of HalpAPEntry64)
- *   +0xB0: JumpSelector (0x18)
- *   +0xB2: HalpAPEntry64 (64-bit code stage starts here)
- * ============================================================
- */
+ * Entered with CS = 0x08, ebp = physical base of the block, paging still off.
+ * Enable paging with the temporary PAE tables, then switch CR3 to the
+ * temporary PML4 (which keeps the low identity mapping and clones the boot
+ * processor's kernel address space) before jumping into long mode.
+ * ===================================================================== */
 HalpAPEntry32:
 
-    /* Set DS/ES/SS/FS/GS = 0x10 (32-bit flat data) */
+    /* marker 'w': entered 32-bit protected mode */
+    db 0B0h, 077h
+    db 0EEh
+
+    /* mov eax, 0x10 ; mov ds/es/ss/fs/gs, ax */
     db 0B8h, 010h, 000h, 000h, 000h
     db 08Eh, 0D8h
     db 08Eh, 0C0h
@@ -150,109 +169,185 @@ HalpAPEntry32:
     db 08Eh, 0E0h
     db 08Eh, 0E8h
 
-    /* Load kernel CR3 low 32 bits from [ebp + 0x40] */
-    db 08Bh, 085h, 040h, 000h, 000h, 000h
+    /* mov eax, [ebp + PaeCr4] ; mov cr4, eax  (enable PAE first) */
+    db 08Bh, 085h
+    dd (HalpAPEntryData - HalpAPEntry16) + 08h
+    db 00Fh, 022h, 0E0h
+
+    /* marker 'a': CR4 programmed */
+    db 0B0h, 061h
+    db 0EEh
+
+    /* mov eax, [ebp + PageTableRoot32] ; mov cr3, eax (PAE PDPT) */
+    db 08Bh, 085h
+    dd (HalpAPEntryData - HalpAPEntry16) + 00h
     db 00Fh, 022h, 0D8h
 
-    /* Enable paging: CR0.PG = 1 */
+    /* marker 'b': CR3 programmed */
+    db 0B0h, 062h
+    db 0EEh
+
+    /* Set EFER.LME (long mode enable) before paging is turned on:
+     *   mov ecx, 0xC0000080 ; rdmsr
+     *   or  eax, [ebp + EferFlags] ; wrmsr */
+    db 0B9h, 080h, 000h, 000h, 0C0h
+    db 00Fh, 032h
+    db 00Bh, 085h
+    dd (HalpAPEntryData - HalpAPEntry16) + 0Ch
+    db 00Fh, 030h
+
+    /* marker 'c': EFER programmed */
+    db 0B0h, 063h
+    db 0EEh
+
+    /* Enable paging: mov eax, cr0 ; or eax, 80000000h ; mov cr0, eax */
     db 00Fh, 020h, 0C0h
     db 00Dh, 000h, 000h, 000h, 080h
     db 00Fh, 022h, 0C0h
 
-    /* Far-jump to 64-bit code (selector 0x18).
-     * Offset patched at runtime by HAL (see spinup.c). */
-    db 0EAh
-    dd 000000000h                   /* offset placeholder - patched by HAL */
-    dd 000000018h                   /* selector 0x18 */
+    /* marker 'd': paging enabled */
+    db 0B0h, 064h
+    db 0EEh
 
-/*
- * ============================================================
- * 64-bit long-mode stage (MASM64 native)
+    /* Progress marker: '2' on COM1 (paging enabled) */
+    db 0BAh, 0F8h, 003h, 000h, 000h                 /* mov edx, 03F8h */
+    db 0B0h, 032h                                   /* mov al, '2' */
+    db 0EEh                                         /* out dx, al */
+
+    /* Far jump to the 64-bit stage: EA <offset32> <selector16 0x18>.
+     * The offset is patched at runtime by the HAL.
+     * CR3 still holds the 32-bit PAE PDPT here; it is replaced with the
+     * temporary PML4 by the long mode stage. */
+    db 0EAh
+HalpAPJump32:
+    dd 000000000h
+    dw 00018h
+
+/* ========================================================================
+ * 64-bit long mode stage
  *
- * At entry: CS=0x18, CR0.PG=1 PE=1 PAE=1, CR3=kernel, EFER.LME=1 SCE=1
- *
- * Layout offsets in KPROCESSOR_STATE (from ketypes.h):
- *   SpecialRegisters.Cr0     : +0x00
- *   SpecialRegisters.Cr3     : +0x10
- *   SpecialRegisters.Cr4     : +0x18
- *   SpecialRegisters.Gdtr.Limit : +0x56
- *   SpecialRegisters.Gdtr.Base  : +0x58
- *   SpecialRegisters.Idtr.Limit : +0x66
- *   SpecialRegisters.Idtr.Base  : +0x68
- *   SpecialRegisters.Tr      : +0x70
- *   ContextFrame.Rsp         : 0xE0 + 0x98 = 0x178
- *   ContextFrame.Rip         : 0xE0 + 0xF8 = 0x1D8
- * ============================================================
- */
+ * Entered with CS = 0x18, CR3 = temporary PAE PDPT (identity 0-4 GiB).
+ * First switch to the temporary PML4 whose entry 0 wraps that same PDPT, then
+ * clone the boot processor's PML4 entries 1..511 so the kernel address space
+ * becomes visible. Entry 0 is left untouched, which keeps this code mapped
+ * for the whole copy.
+ * ===================================================================== */
 HalpAPEntry64:
 
-    /* Get address of HalpAPEntryData (rip-relative in MASM64) */
-    lea     rax, HalpAPEntryData
-    mov     rcx, qword ptr [rax + 18h]     /* ProcessorState at +0x18 */
-    test    rcx, rcx
+    /* r15 = address of the boot data inside the copied block */
+    lea     r15, HalpAPEntryData
+
+    /* Switch to the temporary PML4 (entry 0 identity maps the low 1 GiB) */
+    mov     rbx, qword ptr [r15 + 10h]
+    test    rbx, rbx
     jz      HaltNow
+    mov     cr3, rbx
 
-    mov     r12, rcx                        /* save ProcessorState ptr */
+    /* Progress marker: '3' on COM1 (PML4 active) */
+    mov     dx, 03F8h
+    mov     al, 033h
+    out     dx, al
 
-    /* Load CR0 */
-    mov     rax, qword ptr [r12 + 00h]
+    /* Copy the boot processor PML4 entries 1..511 into our PML4.
+     * The source is the boot CR3 physical address, reachable because the low
+     * 1 GiB are identity mapped by the PDPT installed above. */
+    mov     rsi, qword ptr [r15 + 20h]      /* BootCr3 */
+    shr     rsi, 12
+    shl     rsi, 12
+    mov     rdi, rbx
+    add     rsi, 8
+    add     rdi, 8
+    mov     ecx, 511
+CopyPml4:
+    mov     rdx, qword ptr [rsi]
+    mov     qword ptr [rdi], rdx
+    add     rsi, 8
+    add     rdi, 8
+    dec     ecx
+    jnz     CopyPml4
+
+    /* Progress marker: '4' on COM1 (kernel PML4 cloned) */
+    mov     dx, 03F8h
+    mov     al, 034h
+    out     dx, al
+
+    /* Restore CR4 (PAE/PGE/OSFXSR/...) then CR0 (PE/PG/WP/...) */
+    mov     rax, qword ptr [r15 + 08h]
+    mov     cr4, rax
+    mov     rax, qword ptr [r15 + 18h]
     mov     cr0, rax
 
-    /* Load CR4 */
-    mov     rax, qword ptr [r12 + 18h]
-    mov     cr4, rax
+    /* Program MSR_GS_BASE and MSR_GS_SWAP with this processor's PCR so that
+     * KeGetCurrentPrcb() works as soon as we enter the kernel. */
+    mov     rbx, qword ptr [r15 + 28h]
+    test    rbx, rbx
+    jz      HaltNow
 
-    /* Load CR3 */
-    mov     rax, qword ptr [r12 + 10h]
-    mov     cr3, rax
+    mov     r8d, 0C0000101h             /* MSR_GS_BASE */
+    mov     ecx, r8d
+    mov     rax, rbx
+    mov     rdx, rax
+    shr     rdx, 32
+    wrmsr
 
-    /* Load GDT. Build 10-byte descriptor on the fly. */
-    lea     rdx, HalpFullGdtDesc
-    movzx   eax, word ptr [r12 + 56h]       /* Gdtr.Limit */
-    mov     word ptr [rdx], ax
-    mov     rax, qword ptr [r12 + 58h]      /* Gdtr.Base */
-    mov     qword ptr [rdx + 2], rax
-    lgdt    fword ptr [rdx]
+    mov     r8d, 0C0000102h             /* MSR_GS_SWAP */
+    mov     ecx, r8d
+    mov     rax, rbx
+    mov     rdx, rax
+    shr     rdx, 32
+    wrmsr
 
-    /* Load IDT */
-    lea     rdx, HalpFullIdtDesc
-    movzx   eax, word ptr [r12 + 66h]       /* Idtr.Limit */
-    mov     word ptr [rdx], ax
-    mov     rax, qword ptr [r12 + 68h]      /* Idtr.Base */
-    mov     qword ptr [rdx + 2], rax
-    lidt    fword ptr [rdx]
-
-    /* Load TSS selector */
-    movzx   eax, word ptr [r12 + 70h]
-    ltr     ax
-
-    /* Set GS = KGDT64_R3_DATA | RPL_MASK = 0x2B
-     * AMD64 uses MSR_GS_BASE for actual PCR base; selector just needs to non-zero.
-     * MSR_GS_BASE must be set by the kernel before GS is used. */
+    /* Select the PCR descriptor (AMD64 ignores its base for GS) */
     mov     ax, 0002Bh
     mov     gs, ax
 
-    /* Load kernel stack */
-    mov     rsp, qword ptr [r12 + 178h]
+    /* Load the real GDT */
+    lea     rdx, HalpFullGdtDesc
+    mov     eax, dword ptr [r15 + 50h]
+    mov     word ptr [rdx], ax
+    mov     rax, qword ptr [r15 + 48h]
+    mov     qword ptr [rdx + 2], rax
+    lgdt    fword ptr [rdx]
 
-    /* Jump to KiSystemStartupBootStack */
-    mov     rax, qword ptr [r12 + 1D8h]
+    /* Load the real IDT */
+    lea     rdx, HalpFullIdtDesc
+    mov     eax, dword ptr [r15 + 60h]
+    mov     word ptr [rdx], ax
+    mov     rax, qword ptr [r15 + 58h]
+    mov     qword ptr [rdx + 2], rax
+    lidt    fword ptr [rdx]
+
+    /* Load the task register */
+    mov     eax, dword ptr [r15 + 68h]
+    ltr     ax
+
+    /* Switch to the per-processor kernel stack and enter the kernel */
+    mov     rsp, qword ptr [r15 + 30h]
+    mov     rax, qword ptr [r15 + 38h]
+
+    /* Progress marker: '5' on COM1 (about to enter the kernel) */
+    mov     dx, 03F8h
+    mov     al, 035h
+    out     dx, al
+
     jmp     rax
 
 HaltNow:
     cli
 .halt_loop:
-    db 0F4h                     /* hlt */
+    db 0F4h
     jmp     .halt_loop
 
-/* 10-byte GDT descriptor buffer for lgdt (2 limit + 8 base) */
-HalpFullGdtDesc LABEL FWORD
+/* Scratch lgdt/lidt operands built at runtime: 2-byte limit + 8-byte base */
+HalpFullGdtDesc:
     dw 00000h
     dq 00000000000000000h
 
-/* 10-byte IDT descriptor buffer for lidt */
-HalpFullIdtDesc LABEL FWORD
+HalpFullIdtDesc:
     dw 00000h
     dq 00000000000000000h
+
+/* End of the block copied into HalpLowStub */
+HalpAPEntry16End:
 
 END

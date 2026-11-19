@@ -58,6 +58,10 @@ typedef struct _APINFO
     KTSS TssNMI;
 } APINFO, *PAPINFO;
 
+/* The HAL derives the PCR address from LoaderBlock->Prcb by subtracting this
+ * offset, keep the two in sync. */
+C_ASSERT(FIELD_OFFSET(KIPCR, Prcb) == 0x180);
+
 /* FUNCTIONS *****************************************************************/
 
 CODE_SEG("INIT")
@@ -69,6 +73,7 @@ KeStartAllProcessors(VOID)
     PAPINFO APInfo;
     ULONG ProcessorCount;
     ULONG MaximumProcessors;
+    ULONG Timeout;
 
     /* Determine maximum number of processors we can start */
     MaximumProcessors = KeMaximumProcessors;
@@ -186,7 +191,10 @@ KeStartAllProcessors(VOID)
         ProcessorState->ContextFrame.EFlags = __readeflags() & ~EFLAGS_INTERRUPT_MASK;
 
         /* Update LoaderBlock for this AP.
+         * KiSystemStartupBootStack dereferences Thread->ApcState.Process before
+         * the thread is initialized, so point it at the system process here.
          * All LoaderBlock fields are ULONG_PTR. */
+        APInfo->Thread.Tcb.ApcState.Process = &PsInitialSystemProcess->Pcb;
         KeLoaderBlock->KernelStack = (ULONG_PTR)KernelStack;
         KeLoaderBlock->Prcb = (ULONG_PTR)&APInfo->Pcr.Prcb;
         KeLoaderBlock->Thread = (ULONG_PTR)&APInfo->Thread.Tcb;
@@ -197,38 +205,36 @@ KeStartAllProcessors(VOID)
         if (!HalStartNextProcessor(KeLoaderBlock, ProcessorState))
         {
             DPRINT1("KeStartAllProcessors: HalStartNextProcessor failed for CPU %lu\n", ProcessorCount);
-            break;
+            goto StartFailed;
         }
 
-        /* Wait for the AP to come up.
-         * The AP clears KeLoaderBlock->Prcb when it finishes boot setup.
-         * We poll until it does, or until a timeout.
-         */
-        ULONG Timeout = 10000; /* ~10 seconds at 1ms per iteration */
+        /* Wait for the AP to come up. The AP clears KeLoaderBlock->Prcb once it
+         * has finished its own boot setup. Poll for up to five seconds. */
+        Timeout = 5000;
         while (KeLoaderBlock->Prcb != 0)
         {
             KeMemoryBarrier();
-            YieldProcessor();
+            KeStallExecutionProcessor(1000);
             if (--Timeout == 0)
-            {
-                DPRINT1("KeStartAllProcessors: Timeout waiting for CPU %lu\n", ProcessorCount);
                 break;
-            }
         }
 
         if (KeLoaderBlock->Prcb != 0)
         {
-            /* AP never finished boot - bail out */
             DPRINT1("KeStartAllProcessors: CPU %lu did not start\n", ProcessorCount);
-            break;
+            goto StartFailed;
         }
-    }
 
-    /* Clean up last failed AP's allocations, if any */
-    ProcessorCount--;
-    if (APInfo)        ExFreePoolWithTag(APInfo, TAG_KERNEL);
-    if (KernelStack)   MmDeleteKernelStack(KernelStack, FALSE);
-    if (DPCStack)      MmDeleteKernelStack(DPCStack, FALSE);
+        /* The processor is running and owns these structures now, never free
+         * them: the PCR, GDT, TSS and stacks are still in use. */
+        continue;
+
+StartFailed:
+        ExFreePoolWithTag(APInfo, TAG_KERNEL);
+        MmDeleteKernelStack(KernelStack, FALSE);
+        MmDeleteKernelStack(DPCStack, FALSE);
+        break;
+    }
 
     DPRINT1("KeStartAllProcessors: %lu AP(s) started successfully\n", ProcessorCount);
 }
