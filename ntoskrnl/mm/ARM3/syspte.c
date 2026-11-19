@@ -233,7 +233,11 @@ MiReserveAlignedSystemPtes(IN ULONG NumberOfPtes,
     //
     // Flush the TLB
     //
+#if defined(_M_AMD64)
+    KeFlushCurrentTb();
+#else
     KeFlushProcessTb();
+#endif
 
     //
     // Return the reserved PTEs
@@ -280,6 +284,12 @@ MiReleaseSystemPtes(IN PMMPTE StartingPte,
     // Zero PTEs
     //
     RtlZeroMemory(StartingPte, NumberOfPtes * sizeof(MMPTE));
+
+#if defined(_M_AMD64)
+    /* Retire translations on every CPU before making these addresses reusable.
+     * Do not hold the system PTE allocator lock across the IPI rendezvous. */
+    KeFlushEntireTb(TRUE, TRUE);
+#endif
 
     //
     // Acquire the System PTE lock

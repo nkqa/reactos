@@ -20,6 +20,7 @@ EXTERN KiGeneralProtectionFaultHandler:PROC
 EXTERN KiXmmExceptionHandler:PROC
 EXTERN KiDeliverApc:PROC
 EXTERN KiDpcInterruptHandler:PROC
+EXTERN KiIpiServiceRoutine:PROC
 EXTERN PsConvertToGuiThread:PROC
 EXTERN MmCreateKernelStack:PROC
 EXTERN MmDeleteKernelStack:PROC
@@ -689,10 +690,14 @@ PUBLIC KiIpiInterrupt
     mov rax, IPI_LEVEL
     mov cr8, rax
 
-    /* End the interrupt */
-    mov dword ptr [APIC_EOI], 0
+    /* Service the packet before acknowledging the interrupt. */
+    mov rcx, rbp
+    xor edx, edx
+    call KiIpiServiceRoutine
 
-    int 3
+    mov dword ptr [APIC_EOI], 0
+    movzx rax, byte ptr [rbp + KTRAP_FRAME_PreviousIrql]
+    mov cr8, rax
 
     /* Return */
     ExitTrap (TF_SAVE_ALL or TF_IRQL)

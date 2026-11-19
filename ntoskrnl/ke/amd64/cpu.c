@@ -360,8 +360,21 @@ VOID
 NTAPI
 KeFlushCurrentTb(VOID)
 {
-    /* Flush the TLB by resetting CR3 */
-    __writecr3(__readcr3());
+    BOOLEAN WereEnabled = KeDisableInterrupts();
+    ULONG64 Cr4 = __readcr4();
+
+    /* CR3 reloads preserve global system translations when PGE is enabled. */
+    if (Cr4 & CR4_PGE)
+    {
+        __writecr4(Cr4 & ~CR4_PGE);
+        __writecr4(Cr4);
+    }
+    else
+    {
+        __writecr3(__readcr3());
+    }
+
+    KeRestoreInterrupts(WereEnabled);
 }
 
 VOID
@@ -482,6 +495,16 @@ KiRestoreProcessorState(
     KiRestoreProcessorControlState(&Prcb->ProcessorState);
 }
 
+static
+ULONG_PTR
+NTAPI
+KiFlushEntireTbTarget(IN ULONG_PTR Argument)
+{
+    UNREFERENCED_PARAMETER(Argument);
+    KeFlushCurrentTb();
+    return 0;
+}
+
 VOID
 NTAPI
 KeFlushEntireTb(IN BOOLEAN Invalid,
@@ -489,17 +512,22 @@ KeFlushEntireTb(IN BOOLEAN Invalid,
 {
     KIRQL OldIrql;
 
-    // FIXME: halfplemented
-    /* Raise the IRQL for the TB Flush */
+    UNREFERENCED_PARAMETER(Invalid);
     OldIrql = KeRaiseIrqlToSynchLevel();
 
-    /* Flush the TB for the Current CPU, and update the flush stamp */
-    KeFlushCurrentTb();
+#ifdef CONFIG_SMP
+    if (AllProcessors && KeNumberProcessors > 1)
+    {
+        KeIpiGenericCall(KiFlushEntireTbTarget, 0);
+    }
+    else
+#endif
+    {
+        KiFlushEntireTbTarget(0);
+    }
 
-    /* Update the flush stamp and return to original IRQL */
-    InterlockedExchangeAdd(&KiTbFlushTimeStamp, 1);
+    InterlockedIncrement(&KiTbFlushTimeStamp);
     KeLowerIrql(OldIrql);
-
 }
 
 NTSTATUS

@@ -12,6 +12,15 @@
 #define NDEBUG
 #include <debug.h>
 
+#if defined(_M_AMD64) && defined(CONFIG_SMP)
+VOID KiSmpTrace(ULONG Event, PKPRCB Prcb, PKTHREAD OldThread,
+                PKTHREAD NewThread, ULONG64 Detail);
+#define SMP_TRACE(Event, Prcb, Old, New, Detail) \
+    KiSmpTrace(Event, Prcb, Old, New, Detail)
+#else
+#define SMP_TRACE(Event, Prcb, Old, New, Detail) ((void)0)
+#endif
+
 #ifdef _WIN64
 # define InterlockedOrSetMember(Destination, SetMember) \
     InterlockedOr64((PLONG64)Destination, SetMember);
@@ -342,6 +351,7 @@ KiDeferredReadyThread(IN PKTHREAD Thread)
             /* Set it in deferred ready mode */
             NextThread->State = DeferredReady;
             NextThread->DeferredProcessor = Prcb->Number;
+            SMP_TRACE(30, Prcb, NextThread, Thread, OldPriority);
             KiReleasePrcbLock(Prcb);
             KiDeferredReadyThread(NextThread);
             return;
@@ -359,6 +369,7 @@ KiDeferredReadyThread(IN PKTHREAD Thread)
             /* Set the thread on standby and as the next thread */
             Thread->State = Standby;
             Prcb->NextThread = Thread;
+            SMP_TRACE(31, Prcb, NextThread, Thread, OldPriority);
 
             /* Release the lock */
             KiReleasePrcbLock(Prcb);
@@ -379,6 +390,7 @@ KiDeferredReadyThread(IN PKTHREAD Thread)
     /* Set this thread as ready */
     Thread->State = Ready;
     Thread->WaitTime = KeTickCount.LowPart;
+    SMP_TRACE(32, Prcb, Thread, NextThread, OldPriority);
 
     /* Insert this thread in the appropriate order */
     Preempted ? InsertHeadList(&Prcb->DispatcherReadyListHead[OldPriority],
@@ -470,6 +482,7 @@ KiSwapThread(IN PKTHREAD CurrentThread,
 
     /* Sanity check and release the PRCB */
     ASSERT(CurrentThread != Prcb->IdleThread);
+    SMP_TRACE(40, Prcb, CurrentThread, NextThread, CurrentThread->WaitIrql);
     KiReleasePrcbLock(Prcb);
 
     /* Save the wait IRQL */
@@ -477,6 +490,8 @@ KiSwapThread(IN PKTHREAD CurrentThread,
 
     /* Swap contexts */
     ApcState = KiSwapContext(WaitIrql, CurrentThread);
+    SMP_TRACE(41, KeGetCurrentPrcb(), CurrentThread,
+              KeGetCurrentThread(), WaitIrql);
 
     /* Get the wait status */
     WaitStatus = CurrentThread->WaitStatus;
@@ -912,7 +927,11 @@ NtYieldExecution(VOID)
         KiAcquirePrcbLock(Prcb);
 
         /* Find a new thread to run if none was selected */
-        if (!Prcb->NextThread) Prcb->NextThread = KiSelectReadyThread(1, Prcb);
+        if (!Prcb->NextThread)
+        {
+            Prcb->NextThread = KiSelectReadyThread(1, Prcb);
+            if (Prcb->NextThread) Prcb->NextThread->State = Standby;
+        }
 
         /* Make sure we still have a next thread to schedule */
         NextThread = Prcb->NextThread;
