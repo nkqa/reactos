@@ -334,7 +334,7 @@ MiBuildNonPagedPool(VOID)
     {
         /* Start with the default (1MB) and add 400 KB for each MB above 4 */
         MmMaximumNonPagedPoolInBytes = MmDefaultMaximumNonPagedPool;
-        MmMaximumNonPagedPoolInBytes += (MmNumberOfPhysicalPages - 1024) /
+        MmMaximumNonPagedPoolInBytes += (SIZE_T)(MmNumberOfPhysicalPages - 1024) /
                                          256 * MmMaxAdditionNonPagedPoolPerMb;
     }
 
@@ -349,7 +349,7 @@ MiBuildNonPagedPool(VOID)
     MmMaximumNonPagedPoolInPages = MmMaximumNonPagedPoolInBytes >> PAGE_SHIFT;
 
     /* Non paged pool starts after the PFN database */
-    MmNonPagedPoolStart = MmPfnDatabase + MxPfnAllocation * PAGE_SIZE;
+    MmNonPagedPoolStart = (PUCHAR)MmPfnDatabase + MxPfnAllocation * PAGE_SIZE;
 
     /* Calculate the nonpaged pool expansion start region */
     MmNonPagedPoolExpansionStart = (PCHAR)MmNonPagedPoolStart +

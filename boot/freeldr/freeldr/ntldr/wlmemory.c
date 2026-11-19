@@ -63,15 +63,14 @@ MempAddMemoryBlock(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock,
     TRACE("MempAddMemoryBlock(BasePage=0x%lx, PageCount=0x%lx, Type=%ld)\n",
           BasePage, PageCount, Type);
 
-    /* Check for memory block after 4GB - we don't support it yet
-       Note: Even last page before 4GB limit is not supported */
+    /* Skip blocks outside the architecture's supported physical page range. */
     if (BasePage >= MM_MAX_PAGE)
     {
         /* Just skip this, without even adding to MAD list */
         return;
     }
 
-    /* Check if last page is after 4GB limit and shorten this block if needed */
+    /* Clip blocks that cross the supported physical page range. */
     if (BasePage + PageCount > MM_MAX_PAGE)
     {
         /* Shorten this block */
@@ -309,7 +308,7 @@ WinLdrSetupMemoryLayout(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock)
     BiosMemoryMapEntryCount = MmGetBiosMemoryMap(&BiosMemoryMap);
 
     /* Now we need to add high descriptors from the bios memory map */
-    for (i = 0; i < BiosMemoryMapEntryCount; i++)
+    for (i = 0; i < BiosMemoryMapEntryCount; i++, BiosMemoryMap++)
     {
         /* Check if its higher than the lookup table */
         if (BiosMemoryMap->BasePage > MmGetHighestPhysicalPage())
