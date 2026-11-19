@@ -25,11 +25,10 @@ extern PVOID HalpLowStub;
 extern PVOID HalpAPEntry16;
 extern PVOID HalpAPEntry16End;
 extern PVOID HalpAPJump16;
-extern PVOID HalpAPJump32;
-extern PVOID HalpAPEntry32;
 extern PVOID HalpAPEntry64;
 extern PVOID HalpAPEntryData;
 extern PVOID HalpMinimalGdtDesc;
+extern PVOID HalpMinimalGdt;
 extern HALP_APIC_INFO_TABLE HalpApicInfoTable;
 
 /* Diagnostics: visible on the boot screen, removed once AP startup is proven */
@@ -256,26 +255,22 @@ HalpPatchApEntryAmd64(
     PCHAR Base = (PCHAR)HalpLowStub;
 
     ULONG OffJump16 = PtrOffset(&HalpAPEntry16, &HalpAPJump16);
-    ULONG OffJump32 = PtrOffset(&HalpAPEntry16, &HalpAPJump32);
     ULONG OffGdtDesc = PtrOffset(&HalpAPEntry16, &HalpMinimalGdtDesc);
     ULONG OffData = PtrOffset(&HalpAPEntry16, &HalpAPEntryData);
 
-    /* Absolute physical targets of the 32-bit and 64-bit stages */
-    ULONG64 Phys32 = LowStubPhys + PtrOffset(&HalpAPEntry16, &HalpAPEntry32);
+    /* Absolute physical target of the long mode stage */
     ULONG64 Phys64 = LowStubPhys + PtrOffset(&HalpAPEntry16, &HalpAPEntry64);
 
-    ASSERT((Phys32 | Phys64) >> 32 == 0);
+    ASSERT(Phys64 >> 32 == 0);
 
-    /* 16-bit far jump: offset32 + selector16 0x08 */
-    *(PULONG)(Base + OffJump16) = (ULONG)Phys32;
-    *(PUSHORT)(Base + OffJump16 + 4) = 0x0008;
+    /* Real mode far jump into the 64-bit stage: offset32 + selector16 0x18 */
+    *(PULONG)(Base + OffJump16) = (ULONG)Phys64;
+    *(PUSHORT)(Base + OffJump16 + 4) = 0x0018;
 
-    /* 32-bit far jump: offset32 + selector16 0x18 */
-    *(PULONG)(Base + OffJump32) = (ULONG)Phys64;
-    *(PUSHORT)(Base + OffJump32 + 4) = 0x0018;
-
-    /* Minimal GDT base (16-bit lgdt takes a 32-bit base) */
-    *(PULONG)(Base + OffGdtDesc + 2) = (ULONG)LowStubPhys;
+    /* Minimal GDT base. This is the GDTR base, so it must point at the first
+     * GDT entry and not at the start of the copied block. */
+    *(PULONG)(Base + OffGdtDesc + 2) =
+        (ULONG)(LowStubPhys + PtrOffset(&HalpAPEntry16, &HalpMinimalGdt));
 
     /* Boot variables */
     PAP_ENTRY_DATA_AMD64 Data = (PAP_ENTRY_DATA_AMD64)(Base + OffData);
@@ -350,12 +345,15 @@ HalStartNextProcessor(
            Pcr);
 
     /* Patch the copied block with this processor's specific values.
-     * EFER.LME (0x400) puts the CPU into long mode, EFER.SCE (0x800) enables
-     * the syscall/sysret instructions. */
+     * EFER is written verbatim by the trampoline, so precompute it here:
+     * take the boot value, force LME (bit 8) and SCE (bit 0), and clear LMA
+     * (bit 10). LMA is read-only and reflects the current long mode state:
+     * the boot CPU has it set, but writing it while paging is still disabled
+     * raises #GP and triple faults the AP. NXE and the rest are preserved. */
     HalpPatchApEntryAmd64(PageTableRoot32,
                           PageTableRoot64,
                           (ULONG)(ProcessorState->SpecialRegisters.Cr4 | CR4_PAE),
-                          (ULONG)(0x400 | 0x800),
+                          (ULONG)((__readmsr(0xC0000080) | 0x100 | 0x1) & ~0x400ULL),
                           ProcessorState,
                           Pcr);
     HalDisplayString("AP: patched, sending SIPI\n");

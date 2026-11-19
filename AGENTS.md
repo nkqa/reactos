@@ -91,16 +91,29 @@
 | --- | --- | --- |
 | 1 | `HalpLowStub` 是 `0xFFFFFFFFFFD05000` 垃圾值 | HAL 写坏地址，STOP 0x50 |
 | 2 | 汇编硬编码 `KPROCESSOR_STATE` 的 ContextFrame 偏移 | AP 的 RSP 变成垃圾，握手永不完成 |
-| 3 | 16 位实模式阶段写 CR3/CR4/EFER | 实模式 #GP，AP 立刻 triple fault |
+| 3 | 16 位阶段对 EAX/ECX/EDX 的操作漏了 `66` 前缀 | CR3/EFER 被截断，`mov ecx` 变成 `mov cx` |
 | 4 | `PtrOffset` 传 `PVOID` 变量而未取地址 | patch 偏移为垃圾，写坏内存 |
 | 5 | `HalpAPEntry16End` 放在 32/64 位段之前 | 32/64 位代码根本没被拷进低地址桩 |
 
-**当前卡点**：AP 串口进度为 `01y`（已执行到开保护模式成功），随后的 16 位远跳 `EA`/`66 EA` 到 32 位段会触发 `#GP → 双重故障 → triple fault`。远跳立即数（`0x6B0E8:0x0008`）与 minimal GDT 内容均已逐字节核对无误，怀疑是 SIPI 后 CS 的默认操作数大小与预期不同，需要下一步用 KD 或指令级追踪确认。
+**当前卡点**：AP 串口进度为 `01abcd` —— 首条指令、lgdt、CR4(PAE)、CR3(PDPT)、EFER(LME)、开 PG+PE **全部成功**，只剩最后一步 far jump 进 long mode 段会 triple fault。`EA` / `66 EA`、跳 32 位兼容段或直接跳 64 位段都试过，立即数与 GDT 均逐字节核对无误，怀疑与 IA-32e 下 16 位兼容模式的 far jump 行为有关，需要 KD 或指令级追踪确认。
+
+**调试过程中修复的关键错误（都已验证）**：
+
+| 错误 | 现象 | 原因 |
+| --- | --- | --- |
+| EFER 写入 `LMA`（bit 10） | `wrmsr` 立刻 triple fault | BSP 的 EFER 带 LMA=1（只读，反映已进入 long mode），AP 在 PG=0 时写入即 #GP；必须先 `& ~0x400` |
+| 把 LME 当成 `0x400` | 同上 | EFER 位：SCE=0x1、**LME=0x100**、LMA=0x400（只读）、NXE=0x800 |
+| 16 位模式缺 `66` 前缀 | CR3 被截断成 16 位、`mov ecx` 变成 `mov cx` | 16 位模式下 `A1`/`B9`/`0D` 等默认是 16 位操作数 |
+| `xor edx, edx` 破坏 `DX` | 之后的 `out dx, al` 全部静默失效，看起来像崩溃 | DX 是串口端口；wrmsr 后必须重新 `mov dx, 3F8h` |
+| `mov bx, imm16` 只写低 16 位 | `lgdt [ebp+ebx]` 从错误地址加载 | 用 `66 BB imm32` 完整加载 EBX，或改用 `cs:[disp16]` |
+| `sgdt [0x500]` 读不到 | 低内存被内核复用 | 低地址桩内的 0x6B300 也会被覆盖；诊断要么在实模式立刻写、要么写显存 |
+| `HalpMapPhysicalMemory64` 返回坏值 | `HalpLowStub` = `0xFFFFFFFFFFD05000` | AMD64 早期该函数不可用，详见 6.7 |
+| bootcd 的 SMP 启动项放在 `==` 之后 | 一直启动 UP 内核，误以为 AP 流程有问题 | `[Operating Systems]` 里 `==` 之后的条目是隐藏项，不能作为 `DefaultOS` |
 
 **诊断手段（已内置，验证后应清理）**：
 
 - `spinup.c` 的 `HalpSerialString`/`HalpSerialHex` 把关键指针打印到 COM1（QEMU `-serial file:` 可读）。
-- `apentry.S` 在关键点 `out 0x3F8` 输出单字符进度：`0`(首条指令) `1`(lgdt 后) `y`(开 PE 成功) `w`(进 32 位段) `a`..`d`(CR4/CR3/EFER/开分页) `2`(32 位完成) `3`..`5`(64 位各阶段)。
+- `apentry.S` 在关键点 `out 0x3F8` 输出单字符进度：`0`(首条指令) `1`(lgdt 后) `a`(CR4) `b`(CR3) `c`(EFER) `d`(开 PG+PE) `w`(进 64 位段) `3`..`5`(64 位各阶段)。注意 `xor edx, edx` 会把 `DX` 清零，之后输出前必须重新 `mov dx, 3F8h`。
 - QEMU 侧用 `-d int,guest_errors -D qemu.log` 抓 `check_exception` 与 vCPU 号，用 QMP `human-monitor-command` 执行 `info registers` / `xp /Nxb <phys>` 读取内存与寄存器。
 - 注意：`-no-shutdown` 会让蓝屏/停机状态保留，便于事后取证；`0x60000` 是 Freeldr 数据区，不能当调试标记用。
 
