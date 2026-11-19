@@ -70,8 +70,8 @@ MempAddMemoryBlock(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock,
         return;
     }
 
-    /* Clip blocks that cross the supported physical page range. */
-    if (BasePage + PageCount > MM_MAX_PAGE)
+    /* Clip blocks at the exclusive physical page limit. */
+    if (PageCount > MM_MAX_PAGE - BasePage)
     {
         /* Shorten this block */
         PageCount = MM_MAX_PAGE - BasePage;
@@ -262,8 +262,7 @@ WinLdrSetupMemoryLayout(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock)
         }
 
         // Process entry
-        if (MemoryMap[i].PageAllocated == LastPageType &&
-            (i != NoEntries-1) )
+        if (MemoryMap[i].PageAllocated == LastPageType)
         {
             PagesCount++;
         }
@@ -278,6 +277,7 @@ WinLdrSetupMemoryLayout(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock)
             PagesCount = 1;
         }
     }
+    MempAddMemoryBlock(LoaderBlock, LastPageIndex, PagesCount, LastPageType);
 
     // TEMP, DEBUG!
     // adding special reserved memory zones for vmware workstation
